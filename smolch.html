@@ -1,0 +1,297 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>smolch</title>
+<style>
+:root{
+--bg:#1E1F21;--fg:#C5C8C6;--accent:#969896;--hint:#63666E;--red:#C66;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--fg);font:15px/1.5 ui-monospace,monospace}
+#chat{flex:1;overflow-y:auto;padding:16px 16px 0;display:flex;flex-direction:column;gap:12px}
+.msg{white-space:pre-wrap;overflow-wrap:anywhere}
+.msg.user{margin-left:auto;font-size:12px;color:var(--accent)}
+.msg.assistant{font-size:14px}
+
+.filetag{color:var(--accent);font-size:.75em}
+#box{display:flex;flex-direction:column}
+#staged{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;background:#17181A}
+#staged:empty{display:none}
+#staged .filetag{padding:0 4px;font-size:12px;background:none;cursor:pointer}
+#staged .filetag.err{color:var(--red)}
+#inwrap{position:relative;display:flex}
+#in{width:100%;height:126px;resize:none;background:#17181A;border:none;padding:8px 12px;font:inherit;font-size:12px;color:var(--fg)}
+#tok{position:absolute;right:12px;top:12px;font-size:12px;color:var(--hint);pointer-events:none}
+
+#in::placeholder{color:var(--hint)}
+#in:focus{outline:none}
+</style>
+</head>
+<body>
+<input type="file" id="fp" multiple hidden>
+<div id="chat"></div>
+<div id="box">
+<div id="staged"></div>
+<div id="inwrap"><textarea id="in" placeholder=
+"enter - send message, shift+enter - new line
+esc - x2 cancel reply / delete last pair, x3 clear conversation
+up/down - cycle sent messages
+pageup/pagedown - navigate conversation
+ctrl+c - copy latest reply, ctrl+o - attach file, ctrl+s - save conversation
+ctrl+alt+enter - set [scheme://]server:port@token"></textarea><span id="tok"><span id="tokN"></span></span></div>
+</div>
+<script>
+const SRVK="smolch.srv";
+let BASE="",TOKEN="";
+try{const s=JSON.parse(localStorage.getItem(SRVK)||"");if(s){BASE=s.b;TOKEN=s.t;}}catch{}
+const KEY="smolch.hist";
+const chat=document.getElementById("chat");
+const inEl=document.getElementById("in");
+let hist;try{hist=JSON.parse(localStorage.getItem(KEY)||"[]");}catch{hist=[];}
+const tokN=document.getElementById("tokN");
+
+function tokCount(){let n=0;for(const m of hist){const c=m.content;if(typeof c==="string")n+=c.length;else for(const p of c)n+=p.type==="text"?p.text.length:60;}return Math.ceil(n/4);}
+function saveHist(){localStorage.setItem(KEY,JSON.stringify(hist));tokN.textContent=tokCount();}
+let ctrl=null;
+let model="";
+let sent=[];
+let bi=-1,draft="";
+const stagedEl=document.getElementById("staged");
+let staged=[];
+function renderStaged(){
+  stagedEl.textContent="";
+  staged.forEach(s=>{const t=document.createElement("span");t.className="filetag"+(s.err?" err":"");t.textContent=s.err?s.name+" — "+s.err:s.name;t.onclick=()=>{staged.splice(staged.indexOf(s),1);clearTimeout(s.t);renderStaged();};stagedEl.appendChild(t);});
+}
+
+function srvMsg(txt,err){
+  const t=document.createElement("span");
+  t.className="filetag"+(err?" err":"");
+  t.textContent=txt;
+  stagedEl.appendChild(t);
+  setTimeout(()=>{t.remove()},3000);
+}
+
+async function loadModel(){
+  try{
+    const d=await(await fetch(BASE+"/v1/models")).json();
+    model=d.data?.[0]?.id||"";
+  }catch{model="";}
+}
+
+function addMsg(role,content){
+  const d=document.createElement("div");
+  d.className="msg "+role;
+  if(typeof content==="string"){d.textContent=content;}
+  else{
+    for(const p of content){
+      if(p.type==="text"){
+        if(p.text.startsWith("[file: ")){const s=document.createElement("span");s.className="filetag";s.textContent=p.text.slice(0,p.text.indexOf("\n"));d.appendChild(s);}
+        else{const s=document.createElement("span");s.textContent=p.text;d.appendChild(s);}
+      }
+      else if(p.type==="image_url"){const s=document.createElement("span");s.className="filetag";s.textContent="[image]";d.appendChild(s);}
+    }
+  }
+  chat.appendChild(d);
+  chat.scrollTop=chat.scrollHeight;
+  return d;
+}
+
+const isImage=f=>f.type.startsWith("image/")&&!f.type.endsWith("svg+xml");
+const isText=f=>f.type.startsWith("text/")||!f.name.includes(".");
+const readDataUrl=f=>new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=()=>rej(r.error);r.readAsDataURL(f);});
+async function fileToParts(file){
+  if(isImage(file))return[{type:"image_url",image_url:{url:await readDataUrl(file)}}];
+  if(isText(file))return[{type:"text",text:"[file: "+file.name+"]\n"+await file.text()}];
+  throw new Error("unsupported file: "+file.name);
+}
+
+async function send(){
+  const text=inEl.value.trim();
+  if(!text)return;
+  try{
+    const r=await fetch(BASE+"/v1/models",{headers:{Authorization:"Bearer "+TOKEN}});
+    if(!r.ok)throw{};
+  }catch{srvMsg("can't connect",1);return;}
+  sent=sent.filter(x=>x!==text);
+  sent.push(text);
+  const files=staged.filter(s=>!s.err);
+  inEl.value="";
+  staged=staged.filter(s=>s.err);
+  renderStaged();
+  const parts=[{type:"text",text},...files.flatMap(s=>s.parts)];
+  const content=parts.length>1?parts:text;
+  const entry={role:"user",content};
+  hist.push(entry);
+  saveHist();
+  const um=addMsg("user",content);
+  doChat(um,entry);
+}
+
+async function doChat(um,entry){
+  const out=document.createElement("span");
+  const m=document.createElement("div");
+  m.className="msg assistant";
+  m.appendChild(out);
+  chat.appendChild(m);
+  let outText="",aborted=false;
+  ctrl=new AbortController();
+  try{
+    const res=await fetch(BASE+"/v1/chat/completions",{
+      method:"POST",
+      headers:{"Content-Type":"application/json",Authorization:"Bearer "+TOKEN},
+      body:JSON.stringify({model,messages:[{role:"system",content:"No emojis."},...hist],stream:true}),
+      signal:ctrl.signal
+    });
+    if(!res.ok){throw new Error((await res.json().catch(()=>({}))).error?.message||res.statusText);}
+    const reader=res.body.getReader();
+    const dec=new TextDecoder();
+    let buf="";
+    for(;;){
+      const{done,value}=await reader.read();
+      if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const lines=buf.split("\n");
+      buf=lines.pop();
+      for(const line of lines){
+        if(!line.startsWith("data: ")||line.slice(6)==="[DONE]")continue;
+        let e;try{e=JSON.parse(line.slice(6));}catch{continue;}
+        const d=e.choices?.[0]?.delta;
+        if(!d?.content)continue;
+        outText+=d.content;
+        out.textContent=outText.trimStart();
+        if(chat.scrollHeight-chat.scrollTop-chat.clientHeight<40)chat.scrollTop=chat.scrollHeight;
+      }
+    }
+  }catch(err){
+    if(err.name==="AbortError")aborted=true;
+    else srvMsg(err.message,1);
+  }finally{
+    ctrl=null;
+    inEl.focus();
+    if(aborted){
+      m.remove();
+      um.remove();
+      const i=hist.lastIndexOf(entry);
+      if(i>=0)hist.splice(i,1);
+    }else{
+      const t=outText.trim();
+      out.textContent=t;
+      hist.push({role:"assistant",content:t});
+    }
+    saveHist();
+    chat.scrollTop=chat.scrollHeight;
+  }
+}
+
+let escN=0,lastEsc=0;
+document.addEventListener("keydown",e=>{
+  if(e.key==="o"&&e.ctrlKey){
+    if(ctrl)return;
+    e.preventDefault();
+    fp.click();
+    return;
+  }
+  if(e.key==="c"&&e.ctrlKey&&!e.shiftKey){
+    if(String(window.getSelection())||(inEl.selectionStart!==inEl.selectionEnd))return;
+    const last=[...hist].reverse().find(m=>m.role==="assistant");
+    if(!last)return;
+    e.preventDefault();
+    const t=typeof last.content==="string"?last.content:last.content.filter(p=>p.type==="text").map(p=>p.text).join("\n");
+    navigator.clipboard.writeText(t).catch(()=>{});
+    srvMsg("copied");
+    return;
+  }
+  if(e.key==="PageUp"||e.key==="PageDown"){
+    chat.scrollBy({top:e.key==="PageUp"?-0.9*chat.clientHeight:0.9*chat.clientHeight,behavior:"smooth"});
+    return;
+  }
+  if(e.key!=="Escape")return;
+  const now=Date.now();
+  escN=now-lastEsc<250?escN+1:1;
+  lastEsc=now;
+  if(escN===2){
+    if(ctrl){ctrl.abort();return;}
+    if(hist.length>=2){
+      hist.splice(-2,2);
+      [...chat.children].slice(-2).forEach(el=>el.remove());
+      saveHist();
+    }
+  }else if(escN===3){
+    ctrl?.abort();
+    hist=[];
+    saveHist();
+    staged=[];
+    renderStaged();
+    chat.innerHTML="";
+  }
+});
+inEl.addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&e.ctrlKey&&e.altKey){
+    e.preventDefault();
+    const m=inEl.value.trim().match(/^(?:(https?):\/\/)?(\S+):(\d+)(?:@(\S*))?$/);
+    if(!m){srvMsg("incorrect pattern",1);return;}
+    BASE=(m[1]||"https")+"://"+m[2]+":"+m[3];
+    TOKEN=m[4]||"";
+    localStorage.setItem(SRVK,JSON.stringify({b:BASE,t:TOKEN}));
+    inEl.value="";
+    loadModel();
+    srvMsg("server set");
+    return;
+  }
+  if(e.key==="Enter"&&!e.shiftKey&&!ctrl){
+    e.preventDefault();
+    bi=-1;
+    send();
+  }else if(e.key==="ArrowUp"&&!ctrl&&sent.length){
+    e.preventDefault();
+    if(bi===-1){draft=inEl.value;bi=sent.length-1;}
+    else if(bi>0)bi--;
+    inEl.value=sent[bi];
+    inEl.setSelectionRange(inEl.value.length,inEl.value.length);
+  }else if(e.key==="ArrowDown"&&bi!==-1){
+    e.preventDefault();
+    if(bi<sent.length-1){bi++;inEl.value=sent[bi];}
+    else{bi=-1;inEl.value=draft;}
+    inEl.setSelectionRange(inEl.value.length,inEl.value.length);
+  }
+});
+async function stageFiles(files){
+  for(const f of files){
+    try{
+      staged.push({name:f.name,parts:await fileToParts(f)});
+    }catch{
+      const s={name:f.name,err:"not supported"};
+      s.t=setTimeout(()=>{const j=staged.indexOf(s);if(j>=0){staged.splice(j,1);renderStaged();}},3000);
+      staged.push(s);
+    }
+  }
+  renderStaged();
+}
+document.addEventListener("dragover",e=>e.preventDefault());
+document.addEventListener("drop",e=>{
+  e.preventDefault();
+  if(ctrl||!e.dataTransfer.files.length)return;
+  stageFiles(e.dataTransfer.files);
+});
+const fp=document.getElementById("fp");
+fp.onchange=()=>{if(!ctrl&&!fp.files.length)return;stageFiles([...fp.files]);fp.value="";};
+document.addEventListener("keydown",e=>{
+  if(!(e.ctrlKey&&e.key==="s"))return;
+  e.preventDefault();
+  if(!hist.length)return;
+  const n=prompt("save conversation as:","chat");
+  if(!n)return;
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(hist,null,2)],{type:"application/json"}));
+  a.download=/\.json$/i.test(n)?n:n+".json";
+  a.click();
+});
+for(const m of hist)addMsg(m.role,m.content);
+saveHist();
+loadModel();
+</script>
+</body>
+</html>
